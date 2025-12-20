@@ -4,3 +4,6 @@
 [submodule "third_party/libero"]
 	path = third_party/libero
 	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "pi_link"]
+	path = pi_link
+	url = https://github.com/REAL-WORLD-RL/pi_link.git
