@@ -1,0 +1,71 @@
+# Run with:
+# docker compose -f examples/libero/compose.yml up --build
+services:
+  runtime:
+    image: libero
+    # depends_on:
+    #   - openpi_server
+    build:
+      context: ../..
+      # dockerfile: examples/libero/Dockerfile
+      dockerfile: examples/libero/Dockerfile_env_svr
+    init: true
+    tty: true
+    # network_mode: host
+    privileged: true
+    volumes:
+      - $PWD:/app
+      - ../../data:/data
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ./10_nvidia.json:/usr/share/glvnd/egl_vendor.d/10_nvidia.json:ro
+      # - /home/magictavern/projects/openpi/examples/libero/10_nvidia.json:/usr/share/glvnd/egl_vendor.d/10_nvidia.json:ro
+
+    environment:
+      # 默认启动 libero_env_server.py 的参数；也可以在宿主机通过 export CLIENT_ARGS 覆盖
+      - CLIENT_ARGS=${CLIENT_ARGS:---max_sessions 2 --session_idle_timeout_s 10}
+      # - CLIENT_ARGS=${CLIENT_ARGS:---max_sessions 3 --session_idle_timeout_s 10 --horizon 100}
+
+      - DISPLAY=$DISPLAY
+      - MUJOCO_GL=${MUJOCO_GL:-egl}
+
+      # 关键：让 nvidia-container-runtime 把 EGL/GL 相关库挂进容器
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "9000:8000"
+
+  openpi_server:
+    image: openpi_server
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy.Dockerfile
+    init: true
+    tty: true
+    # network_mode: host
+    volumes:
+      - $PWD:/app
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+    environment:
+      - SERVER_ARGS
+      - OPENPI_DATA_HOME=/openpi_assets
+      - IS_DOCKER=true
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.6  # 添加这一行，限制显存占用
+
+    # Comment out this block if not running on a machine with GPUs.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "9001:8000"
