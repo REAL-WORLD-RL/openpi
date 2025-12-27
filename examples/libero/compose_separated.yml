@@ -13,6 +13,10 @@ services:
     tty: true
     # network_mode: host
     privileged: true
+    gpus:
+      - driver: nvidia
+        device_ids: ["6", "7"]
+        capabilities: ["gpu"]
     volumes:
       - $PWD:/app
       - ../../data:/data
@@ -27,9 +31,12 @@ services:
 
       - DISPLAY=$DISPLAY
       - MUJOCO_GL=${MUJOCO_GL:-egl}
+      # 容器只暴露物理 GPU 6,7（见 NVIDIA_VISIBLE_DEVICES / gpus.device_ids），因此容器内 CUDA 设备索引会重映射为 0,1
+      - CUDA_VISIBLE_DEVICES=0,1
+      # Robosuite/MuJoCo EGL 需要使用“容器内可见 GPU 的索引”，因此这里应为 0 或 1（不是物理 GPU id）
+      - MUJOCO_EGL_DEVICE_ID=0
 
       # 关键：让 nvidia-container-runtime 把 EGL/GL 相关库挂进容器
-      - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
     deploy:
@@ -37,7 +44,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: 2
               capabilities: [gpu]
     ports:
       - "9000:8000"
@@ -50,6 +57,10 @@ services:
     init: true
     tty: true
     # network_mode: host
+    gpus:
+      - driver: nvidia
+        device_ids: ["6", "7"]
+        capabilities: ["gpu"]
     volumes:
       - $PWD:/app
       - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
@@ -58,6 +69,10 @@ services:
       - OPENPI_DATA_HOME=/openpi_assets
       - IS_DOCKER=true
       - XLA_PYTHON_CLIENT_MEM_FRACTION=0.6  # 添加这一行，限制显存占用
+      # 容器只暴露物理 GPU 6,7，因此容器内 CUDA 设备索引会重映射为 0,1
+      - CUDA_VISIBLE_DEVICES=0,1
+      - NVIDIA_VISIBLE_DEVICES=6,7
+      - NVIDIA_DRIVER_CAPABILITIES=all
 
     # Comment out this block if not running on a machine with GPUs.
     deploy:
@@ -65,7 +80,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: 2
               capabilities: [gpu]
     ports:
       - "9001:8000"
