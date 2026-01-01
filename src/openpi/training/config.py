@@ -20,6 +20,8 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.mujoco_franka_policy as mujoco_franka_policy
+import openpi.policies.real_franka_policy as real_franka_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -461,6 +463,111 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# cys: custom data config for real franka robot
+@dataclasses.dataclass(frozen=True)
+class LeRobotRealFrankaDataConfig(DataConfigFactory):
+    """
+    Config for training on maniskill5 dataset.
+    Features: 2 cameras (base_camera, hand_camera), 42-dim state, 7-dim action.
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps keys from the LeRobot dataset to the format expected by real_franka_policy.py
+        # Real Franka dataset has: side_policy, wrist_1, wrist_2
+        # We don't need RepackTransform since RealFrankaInputs dynamically handles camera mapping
+        # Just pass through all observation.images.* keys
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.side_policy": "observation.images.side_policy",
+                        "observation.images.wrist_1": "observation.images.wrist_1",
+                        "observation.images.wrist_2": "observation.images.wrist_2",
+                        "observation.state": "observation.state",
+                        "action": "action",
+                        "task": "task",
+                    }
+                )
+            ]
+        )
+
+        # Use maniskill5-specific data transforms defined in maniskill5_policy.py
+        # These transforms handle the conversion between dataset format and model input format
+        data_transforms = _transforms.Group(
+            inputs=[real_franka_policy.RealFrankaInputs(model_type=model_config.model_type)],
+            outputs=[real_franka_policy.RealFrankaOutputs()],
+        )
+
+        # For maniskill5 新数据集 with 8-dim actions:
+        # If your actions are absolute (e.g., target joint positions), apply delta transform.
+        # The delta_action_mask specifies which actions to convert to deltas.
+        # Typically, the last action dimension is the gripper, which should remain absolute.
+        # Here we apply delta to the first 7 actions (joints) and keep the 8th (gripper) absolute.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)  # First 7 dims to delta, last 1 dim absolute
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),  # 数据集中使用"action"，RepackTransform会映射为"actions"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotMujocoFrankaDataConfig(DataConfigFactory):
+    """
+    Config for training on Mujoco Franka dataset.
+    Features: 2 cameras (front, wrist), 7-dim state, 4-dim action.
+    """
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.front": "observation.images.front",
+                        "observation.images.wrist": "observation.images.wrist",
+                        "observation.state": "observation.state",
+                        "action": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[mujoco_franka_policy.MujocoFrankaInputs(model_type=model_config.model_type)],
+            outputs=[mujoco_franka_policy.MujocoFrankaOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -558,6 +665,167 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    #
+    # Fine-tuning Real Franka configs.
+    #
+    TrainConfig(
+        # Pi0.5 model fine-tuning for Real Franka robot
+        name="pi05_libero_real_franka",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotRealFrankaDataConfig(
+            repo_id="pickup_100_demos_lerobot",
+            # use_delta_joint_actions=False,  # Pi0.5 typically uses absolute actions
+            # default_prompt="Pick up the white plug",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            # assets=AssetsConfig(
+            #     assets_dir=None,  # Use default local assets dir
+            #     asset_id=None,
+            # ),
+        ),
+        batch_size=64,  # Reduced from 256 to avoid OOM on A800 80GB GPUs
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+        # num_workers=2,
+    ),
+
+    TrainConfig(
+        name="pi05_libero_real_franka_lora",
+        # Here is an example of loading a pi0.5 model for LoRA fine-tuning on Libero.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotRealFrankaDataConfig(
+            repo_id="pickup_100_demos_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
+    TrainConfig(
+        # Pi0.5 model fine-tuning for Mujoco Franka robot
+        name="pi05_mujoco_franka",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotMujocoFrankaDataConfig(
+            # LeRobotDataset uses `local_files_only` when loading from hub if not found locally.
+            # But since we set HF_LEROBOT_HOME correctly in the script, it should find it.
+            # If it still tries to hit the hub, it means it thinks the local data is incomplete or invalid.
+            repo_id="franka_lift_cube_success_trajs_100_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="Pick up the cube",
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+    ),
+
+    TrainConfig(
+        name="pi05_mujoco_franka_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotMujocoFrankaDataConfig(
+            repo_id="franka_lift_cube_success_trajs_100_lerobot",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="Pick up the cube",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+
+    # TrainConfig(
+    #     # Pi0.5 LoRA fine-tuning for Real Franka (low memory)
+    #     name="pi05_real_franka_lora",
+    #     model=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         action_horizon=10,
+    #         discrete_state_input=False,
+    #         paligemma_variant="gemma_2b_lora",
+    #         action_expert_variant="gemma_300m_lora",
+    #     ),
+    #     data=LeRobotRealFrankaDataConfig(
+    #         repo_id="pickup_100_demos_lerobot",
+    #         use_delta_joint_actions=False,  # Pi0.5 typically uses absolute actions
+    #         default_prompt="Pick up the white plug",
+    #         assets=AssetsConfig(
+    #             assets_dir=None,  # Use default local assets dir: assets/pi05_real_franka_lora/
+    #             asset_id=None,
+    #         ),
+    #     ),
+    #     batch_size=64,
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         warmup_steps=5_000,
+    #         peak_lr=5e-5,
+    #         decay_steps=500_000,
+    #         decay_lr=5e-5,
+    #     ),
+    #     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    #     # Use pi05_base instead of pi05_libero to match action_dim=7
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    #     freeze_filter=pi0_config.Pi0Config(
+    #         pi05=True,
+    #         paligemma_variant="gemma_2b_lora",
+    #         action_expert_variant="gemma_300m_lora"
+    #     ).get_freeze_filter(),
+    #     ema_decay=None,  # Turn off EMA for LoRA
+    #     num_train_steps=20_000,
+    #     num_workers=2,
+    # ),
     #
     # Inference Aloha configs.
     #
