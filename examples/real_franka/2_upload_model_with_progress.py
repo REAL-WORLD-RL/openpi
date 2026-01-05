@@ -12,10 +12,13 @@ import shutil
 MODEL_SCOPE_TOKEN = "ms-f8cd0f84-70dc-42be-910b-1d801832b214"
 # Configuration
 # LOCAL_CHECKPOINT_PATH = "checkpoints/pi05_libero_real_franka_lora/lora_libero_real_franka_pickup_100demos/29999"
-LOCAL_CHECKPOINT_PATH = "checkpoints/pi05_real_franka_lora/full_libero_real_franka_pickup_100demos/29999"
-MODEL_ID = "YishuaiCai/pi05_libero_full_real_franka_pickup"
+# LOCAL_CHECKPOINT_PATH = "checkpoints/pi05_real_franka_lora/full_libero_real_franka_pickup_100demos/29999"
+# MODEL_ID = "YishuaiCai/pi05_libero_full_real_franka_pickup"
 # MODEL_ID = "YishuaiCai/pi05_base_lora_real_franka_pickup"
 
+
+LOCAL_CHECKPOINT_PATH = "checkpoints/real_plug_insert_pi05_libero_lora/real_plug_insert_libero_lora_100demos/49999"
+MODEL_ID = "YishuaiCai/pi05_libero_full_real_franka_plug_insert"
 
 # LOCAL_CHECKPOINT_PATH = "checkpoints/pi05_mujoco_franka_lora/pi05_libero_mujoco_franka_lora/29999"
 # MODEL_ID = "YishuaiCai/pi05_libero_lora_mujoco_franka_pickup"

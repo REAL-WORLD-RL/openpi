@@ -7,7 +7,7 @@ import difflib
 import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
-
+import openpi.policies.maniskill5_policy as maniskill5_policy
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -663,11 +663,143 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# wps
+@dataclasses.dataclass(frozen=True)
+class LeRobotManiskill5DataConfig(DataConfigFactory):
+    """
+    Config for training on maniskill5 dataset.
+    Features: 1 camera (base_camera), 42-dim state, 8-dim action.
+    Note: PickCube-v1 only has base_camera, no hand_camera.
+    Control mode: pd_joint_pos (absolute joint positions: 7 joints + 1 gripper)
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps keys from the LeRobot dataset to the format expected by maniskill5_policy.py
+        # 由于转换后的数据集已经使用了 "observation.images.base_camera" 格式（. 分隔符），
+        # 所以这里是恒等映射（输入键名 = 输出键名）
+        # 注意：action 保持为 "action"（不需要映射为 "actions"）
+        # 注意：PickCube-v1 只有 base_camera，没有 hand_camera，所以不映射 hand_camera
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.base_camera": "observation.images.base_camera",
+                        "observation.state": "observation.state",
+                        "action": "action",
+                        "task": "task",
+                    }
+                )
+            ]
+        )
+
+        # Use maniskill5-specific data transforms defined in maniskill5_policy.py
+        # These transforms handle the conversion between dataset format and model input format
+        data_transforms = _transforms.Group(
+            inputs=[maniskill5_policy.Maniskill5Inputs(model_type=model_config.model_type)],
+            outputs=[maniskill5_policy.Maniskill5Outputs()],
+        )
+
+        # For maniskill5 dataset with 8-dim actions (pd_joint_pos control mode):
+        # The actions in the dataset are ABSOLUTE joint positions (7 joints + 1 gripper).
+        # Set extra_delta_transform=True only if you want to convert absolute actions to deltas for training.
+        # By default, extra_delta_transform=False means we train on absolute positions directly.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)  # First 7 dims to delta, last 1 dim absolute
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),  # 数据集中使用"action"，RepackTransform会映射为"actions"
+        )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
     # Fine-tuning Real Franka configs.
     #
+    TrainConfig( # wps added
+        name="pi05_maniskill5_lora",
+        # Here is an example of loading a pi0.5 model for LoRA fine-tuning on Libero.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotManiskill5DataConfig(
+            repo_id="wps852/pushcube",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        num_train_steps=36_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+
+        # model=pi0_config.Pi0Config(pi05=True, action_horizon=10,
+        #     discrete_state_input=False,
+        #     paligemma_variant="gemma_2b_lora",
+        #     action_expert_variant="gemma_300m_lora"),
+        # data=LeRobotManiskill5DataConfig(
+        #     repo_id="wps852/pushcube",
+        #     base_config=DataConfig(prompt_from_task=True),
+        #     extra_delta_transform=False,
+        # ),
+        # batch_size=256,
+        # lr_schedule=_optimizer.CosineDecaySchedule(
+        #     warmup_steps=10_000,
+        #     peak_lr=5e-5,
+        #     decay_steps=1_000_000,
+        #     decay_lr=5e-5,
+        # ),
+        # optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # ema_decay=0.999,
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        # num_train_steps=30_000,
+        # # The freeze filter defines which parameters should be frozen during training.
+        # # We have a convenience function in the model config that returns the default freeze filter
+        # # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # # you chose above.
+        # freeze_filter=pi0_config.Pi0Config(
+        #     pi05=True,
+        #     action_horizon=10,
+        #     discrete_state_input=False,
+        #     paligemma_variant="gemma_2b_lora",
+        #     action_expert_variant="gemma_300m_lora"
+        # ).get_freeze_filter(),
+        # # Turn off EMA for LoRA finetuning.
+        # ema_decay=None,
+    ),
+
+
     TrainConfig(
         # Pi0.5 model fine-tuning for Real Franka robot
         name="pi05_libero_real_franka",
