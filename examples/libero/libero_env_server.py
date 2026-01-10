@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 """
-Libero websocket env server (RemoteEnv-compatible), but with episode/time-limit logic aligned
-to `examples/libero/main.py`.
+Libero websocket env server (RemoteEnv-compatible), built on GymEnvServer base class.
 
-Key alignment to main.py:
-- Uses per-suite `max_steps` (libero_spatial/object/goal/10/90) instead of relying on robosuite horizon.
+Key features specific to LIBERO:
+- Uses per-suite `max_steps` (libero_spatial/object/goal/10/90) aligned to examples/libero/main.py.
 - Performs `num_steps_wait` dummy steps during reset (so client policy steps start at t=0).
 - Treats LIBERO `done=True` as success/termination; time-limit is reported as truncated=True.
+- Manages task suites, task IDs, and initial states.
 
 Protocol compatibility:
-- Speaks the `pi_link.remote_env.RemoteEnv` websocket protocol (handshake + reset/step/close).
-- Supports optional session_id routing (fixed worker pool) so multiple RemoteEnv clients can connect.
-
-This file intentionally reuses the existing server's structure with minimal changes, only swapping
-the episode length logic to match `examples/libero/main.py`.
+- Inherits RemoteEnv-compatible websocket protocol from GymEnvServer.
+- Supports session_id routing with fixed worker pool.
 """
 
 import argparse
@@ -24,19 +21,16 @@ import math
 import pathlib
 import sys
 import time
-import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import numpy as np
-import websockets
-import websockets.asyncio.server as _server
 
-# Allow running as a script: `python examples/libero/libero_env_server_mainlike.py`
+# Allow running as a script: `python examples/libero/libero_env_server.py`
 # Add repo root to sys.path so local imports like `pi_link.*` work.
 if __package__ in (None, ""):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from pi_link import msgpack_numpy  # noqa: E402
+from pi_link.gym_env_server import GymEnvServer  # noqa: E402
 from pi_link.spaces import libero_default_space_specs  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -164,7 +158,7 @@ def _best_effort_set_env_horizon(env: Any, horizon: int) -> Optional[int]:
     return None
 
 
-def _worker_loop(
+def _libero_worker_loop(
     *,
     task_suite_name: str,
     task_id: int,
@@ -175,7 +169,7 @@ def _worker_loop(
     max_steps_override: Optional[int],
     conn: Any,  # multiprocessing.connection.Connection
 ) -> None:
-    """Worker process: owns one Libero env and handles reset/step."""
+    """Worker process for LIBERO env with special initialization and warmup logic."""
     task_suite = _load_task_suite(task_suite_name)
     task = task_suite.get_task(task_id)
     initial_states = task_suite.get_task_init_states(task_id)
@@ -183,10 +177,6 @@ def _worker_loop(
 
     # Episode length in *policy steps* (warmup already happens inside reset).
     max_steps = int(max_steps_override) if max_steps_override is not None else _max_steps_for_suite(task_suite_name)
-
-    # Best-effort: keep underlying robosuite time limit safely above our own,
-    # so the server controls truncation instead of robosuite raising.
-    # We already do `num_steps_wait` steps during reset, which count internally.
 
     episode_idx = 0
     current_obs_raw: Optional[dict] = None
@@ -214,13 +204,15 @@ def _worker_loop(
         env.reset()
         init_state = _select_init_state(options)
         current_obs_raw = env.set_init_state(init_state)
+        # LIBERO-specific warmup steps
         for _ in range(num_steps_wait):
             current_obs_raw, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
         episode_over = False
         steps_since_reset = 0
-        return _process_obs(current_obs_raw, task_description=task_description, resize_size=resize_size)
+        processed_obs = _process_obs(current_obs_raw, task_description=task_description, resize_size=resize_size)
+        return {"obs": processed_obs, "info": {}}
 
-    def _do_step(action: Any) -> Tuple[dict, float, bool, bool, dict]:
+    def _do_step(action: Any) -> dict:
         nonlocal current_obs_raw, episode_over, steps_since_reset
         if current_obs_raw is None:
             raise RuntimeError("Environment not reset; call reset first.")
@@ -244,7 +236,15 @@ def _worker_loop(
             info = dict(info)
             info["TimeLimit.truncated"] = True
             info["TimeLimit.max_steps"] = int(max_steps)
-        return obs, float(reward), terminated, truncated, info
+        
+        return {
+            "obs": obs,
+            "reward": float(reward),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "done": bool(terminated or truncated),
+            "info": info,
+        }
 
     def _infer_specs() -> dict:
         # Size `observation/state` without advancing episode_idx (use initial_states[0]).
@@ -264,6 +264,7 @@ def _worker_loop(
             "num_steps_wait": int(num_steps_wait),
         }
 
+    # Worker message loop
     while True:
         req = conn.recv()
         if not isinstance(req, dict):
@@ -273,43 +274,25 @@ def _worker_loop(
         try:
             if cmd == "infer_specs":
                 conn.send(_infer_specs())
-                continue
-            if cmd == "reset":
-                conn.send(
-                    {
-                        "obs": _do_reset(req.get("seed"), req.get("options")),
-                        "info": {},
-                    }
-                )
-                continue
-            if cmd == "step":
-                obs, reward, terminated, truncated, info = _do_step(req.get("action"))
-                conn.send(
-                    {
-                        "obs": obs,
-                        "reward": reward,
-                        "terminated": bool(terminated),
-                        "truncated": bool(truncated),
-                        "done": bool(terminated or truncated),
-                        "info": info,
-                    }
-                )
-                continue
-            if cmd == "close":
+            elif cmd == "reset":
+                conn.send(_do_reset(req.get("seed"), req.get("options")))
+            elif cmd == "step":
+                conn.send(_do_step(req.get("action")))
+            elif cmd == "close":
+                if hasattr(env, 'close'):
+                    env.close()
                 conn.send({"ok": True})
                 return
-            conn.send({"error": {"code": "unknown_cmd", "message": f"Unknown cmd: {cmd}"}})
+            else:
+                conn.send({"error": {"code": "unknown_cmd", "message": f"Unknown cmd: {cmd}"}})
         except Exception as e:  # noqa: BLE001
+            logger.exception(f"Worker error on cmd={cmd}")
             conn.send({"error": {"code": "worker_error", "message": str(e), "type": type(e).__name__}})
 
 
-########################################################################################
-# Router / session manager (fixed worker pool)
-########################################################################################
 
-
-class LiberoEnvServer:
-    """Websocket env server with a fixed worker pool and session_id routing."""
+class LiberoEnvServer(GymEnvServer):
+    """Websocket env server for LIBERO with task suite management."""
 
     def __init__(
         self,
@@ -322,45 +305,58 @@ class LiberoEnvServer:
         resize_size: int,
         num_steps_wait: int,
         max_steps: Optional[int],
-        horizon: Optional[int],
         max_sessions: int,
         session_idle_timeout_s: float,
     ) -> None:
         import multiprocessing as mp
 
-        self._host = host
-        self._port = port
         self._task_suite_name = task_suite_name
         self._task_id = task_id
         self._seed = seed
         self._resize_size = resize_size
         self._num_steps_wait = num_steps_wait
         self._max_steps_override = int(max_steps) if max_steps is not None else None
-        self._max_sessions = int(max_sessions)
-        self._session_idle_timeout_s = float(session_idle_timeout_s)
-
-        if self._max_sessions <= 0:
-            raise ValueError("--max_sessions must be > 0")
-
-        self._mp = mp.get_context("spawn")
-
-        self._workers: list[dict] = []
-        self._free_workers: list[int] = []
-        self._session_to_worker: Dict[str, int] = {}
-        self._worker_to_session: Dict[int, Optional[str]] = {}
-        self._last_used_s: Dict[str, float] = {}
-
-        self._space_specs: Optional[Tuple[Dict, Dict]] = None
+        
+        # Cache for metadata
         self._task_description: Optional[str] = None
         self._max_steps_effective: Optional[int] = None
+        self._state_dim: Optional[int] = None
+        
+        # Use custom multiprocessing context
+        self._mp = mp.get_context("spawn")
+        
+        # Initialize base class WITHOUT starting workers (we'll do custom worker start)
+        self._host = host
+        self._port = port
+        self._max_sessions = int(max_sessions)
+        self._session_idle_timeout_s = float(session_idle_timeout_s)
+        
+        if self._max_sessions <= 0:
+            raise ValueError("max_sessions must be > 0")
+        
+        # Worker pool
+        self._workers: list[dict] = []
+        self._free_workers: list[int] = []
+        
+        # Session management
+        self._session_to_worker: dict[str, int] = {}
+        self._worker_to_session: dict[int, Optional[str]] = {}
+        self._last_used_s: dict[str, float] = {}
+        
+        # Cached specs
+        self._space_specs: Optional[dict] = None
+        
+        # Start LIBERO-specific workers
+        self._start_libero_workers()
 
-        self._start_workers()
-
-    def _start_workers(self) -> None:
+    def _start_libero_workers(self) -> None:
+        """Start worker pool with LIBERO-specific configuration."""
+        import asyncio
+        
         for wid in range(self._max_sessions):
             parent_conn, child_conn = self._mp.Pipe(duplex=True)
             proc = self._mp.Process(
-                target=_worker_loop,
+                target=_libero_worker_loop,
                 kwargs=dict(
                     task_suite_name=self._task_suite_name,
                     task_id=self._task_id,
@@ -379,293 +375,94 @@ class LiberoEnvServer:
             self._free_workers.append(wid)
             self._worker_to_session[wid] = None
 
-    def serve_forever(self) -> None:
-        asyncio.run(self.run())
+    async def _ensure_space_specs(self) -> None:
+        """Infer and cache LIBERO-specific space specs."""
+        if self._space_specs is not None:
+            return
+        
+        # Import needed here to avoid issues
+        from pi_link.gym_env_server import _WorkerCrashed
+        
+        resp = await self._call_worker(0, {"cmd": "infer_specs"})
+        if "error" in resp:
+            raise RuntimeError(f"Failed to infer specs: {resp['error']}")
+        
+        self._task_description = str(resp.get("task_description", ""))
+        self._max_steps_effective = int(resp.get("max_steps", 0))
+        self._state_dim = int(resp.get("state_dim", 0))
+        
+        # Build space specs
+        obs_spec, action_spec = libero_default_space_specs(
+            resize_size=self._resize_size, 
+            state_dim=self._state_dim
+        )
+        
+        self._space_specs = {
+            "observation_space_spec": obs_spec,
+            "action_space_spec": action_spec,
+            "sample_obs": None,  # Not needed for LIBERO
+        }
+        
+        logger.info("LIBERO space specs inferred successfully")
+
+    def get_metadata(self) -> dict:
+        """Return LIBERO-specific server metadata."""
+        metadata = {
+            "kind": "libero_env_server",
+            "task_suite_name": self._task_suite_name,
+            "task_id": self._task_id,
+            "task_description": self._task_description,
+            "resize_size": self._resize_size,
+            "max_steps": self._max_steps_effective,
+            "max_sessions": self._max_sessions,
+            "idle_timeout_s": self._session_idle_timeout_s,
+        }
+        return metadata
 
     async def run(self) -> None:
+        """Override to add LIBERO-specific logging."""
+        import websockets.asyncio.server as _server
+        
         await self._ensure_space_specs()
-        async with _server.serve(self._handler, self._host, self._port, compression=None, max_size=None) as server:
+        
+        async with _server.serve(
+            self._handler,
+            self._host,
+            self._port,
+            compression=None,
+            max_size=None,
+        ) as server:
             logger.info("Libero env websocket server listening on ws://%s:%d", self._host, self._port)
             logger.info("Task suite=%s task_id=%d", self._task_suite_name, self._task_id)
             if self._task_description:
                 logger.info("Task description=%s", self._task_description)
             if self._max_steps_effective is not None:
                 logger.info("Episode max_steps=%d (main.py-aligned)", self._max_steps_effective)
+            
             reaper_task = asyncio.create_task(self._reap_idle_sessions())
             try:
                 await server.serve_forever()
             finally:
                 reaper_task.cancel()
 
-    async def _ensure_space_specs(self) -> None:
-        if self._space_specs is not None:
-            return
-        resp = await self._call_worker(0, {"cmd": "infer_specs"})
-        if "error" in resp:
-            raise RuntimeError(f"Failed to infer specs: {resp['error']}")
-        self._task_description = str(resp.get("task_description", ""))
-        if resp.get("max_steps") is not None:
-            self._max_steps_effective = int(resp["max_steps"])
-        state_dim = int(resp["state_dim"])
-        self._space_specs = libero_default_space_specs(resize_size=self._resize_size, state_dim=state_dim)
+    # These methods are not used since we override worker management
+    def create_env(self, **kwargs) -> Any:
+        """Not used - LIBERO uses custom worker loop."""
+        raise NotImplementedError("LIBERO uses custom worker management")
+    
+    def process_observation(self, obs: Any) -> dict:
+        """Not used - LIBERO uses custom worker loop."""
+        raise NotImplementedError("LIBERO uses custom worker management")
 
-    async def _reap_idle_sessions(self) -> None:
-        if self._session_idle_timeout_s <= 0:
-            return
-        while True:
-            await asyncio.sleep(1.0)
-            now = _now_s()
-            for sid, last_used in list(self._last_used_s.items()):
-                if now - last_used < self._session_idle_timeout_s:
-                    continue
-                wid = self._session_to_worker.get(sid)
-                if wid is None:
-                    self._last_used_s.pop(sid, None)
-                    continue
-                if self._workers[wid]["lock"].locked():
-                    continue
-                logger.info("Auto-releasing idle session_id=%s (worker stays alive)", sid)
-                self._release_session(sid)
 
-    def _release_session(self, session_id: str) -> None:
-        wid = self._session_to_worker.pop(session_id, None)
-        self._last_used_s.pop(session_id, None)
-        if wid is None:
-            return
-        self._worker_to_session[wid] = None
-        self._free_workers.append(wid)
-
-    def _alloc_session(self, requested_session_id: Optional[str]) -> Tuple[str, int]:
-        if not self._free_workers:
-            raise RuntimeError("capacity_full")
-        # If client requested a custom session_id and it's not already taken, honor it.
-        if requested_session_id and requested_session_id not in self._session_to_worker:
-            sid = requested_session_id
-        else:
-            sid = uuid.uuid4().hex
-        wid = self._free_workers.pop()
-        self._session_to_worker[sid] = wid
-        self._worker_to_session[wid] = sid
-        self._last_used_s[sid] = _now_s()
-        return sid, wid
-
-    async def _call_worker(self, worker_id: int, msg: dict) -> dict:
-        w = self._workers[worker_id]
-        proc = w["proc"]
-        if not proc.is_alive():
-            raise _WorkerCrashed(f"worker {worker_id} is not alive (exitcode={proc.exitcode})")
-
-        async with w["lock"]:
-            conn = w["conn"]
-
-            def _sync_roundtrip() -> dict:
-                conn.send(msg)
-                return conn.recv()
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _sync_roundtrip)
-
-    def _err(self, *, code: str, message: str, details: Optional[dict] = None, request_id: Any = None) -> dict:
-        out: dict = {"error": {"code": code, "message": message}}
-        if details:
-            out["error"]["details"] = details
-        if request_id is not None:
-            out["request_id"] = request_id
-        return out
-
-    async def _handler(self, ws: _server.ServerConnection) -> None:
-        packer = msgpack_numpy.Packer()
-        await self._ensure_space_specs()
-
-        await ws.send(
-            packer.pack(
-                {
-                    "kind": "libero_env_server",
-                    "task_suite_name": self._task_suite_name,
-                    "task_id": self._task_id,
-                    "task_description": self._task_description,
-                    "resize_size": self._resize_size,
-                    "max_steps": self._max_steps_effective,
-                    "observation_space_spec": self._space_specs[0] if self._space_specs else None,
-                    "action_space_spec": self._space_specs[1] if self._space_specs else None,
-                    "session_protocol": {
-                        "enabled": True,
-                        "max_sessions": self._max_sessions,
-                        "idle_timeout_s": self._session_idle_timeout_s,
-                    },
-                }
-            )
-        )
-
-        while True:
-            try:
-                req_raw = await ws.recv()
-                req = msgpack_numpy.unpackb(req_raw)
-                if not isinstance(req, dict):
-                    await ws.send(packer.pack(self._err(code="bad_request", message=f"Expected dict, got {type(req)}")))
-                    continue
-
-                cmd = req.get("cmd")
-                request_id = req.get("request_id")
-                session_id = req.get("session_id")
-
-                if cmd == "close":
-                    await ws.send(packer.pack({"ok": True, "request_id": request_id}))
-                    await ws.close(code=websockets.frames.CloseCode.NORMAL_CLOSURE, reason="Closed by client.")
-                    return
-
-                if cmd == "close_session":
-                    if not session_id or str(session_id) not in self._session_to_worker:
-                        await ws.send(
-                            packer.pack(
-                                self._err(
-                                    code="invalid_session",
-                                    message="close_session requires a valid session_id",
-                                    details={"session_id": session_id},
-                                    request_id=request_id,
-                                )
-                            )
-                        )
-                        continue
-                    self._release_session(str(session_id))
-                    await ws.send(packer.pack({"ok": True, "session_id": str(session_id), "request_id": request_id}))
-                    continue
-
-                if cmd == "ping":
-                    # Heartbeat to keep session alive
-                    if session_id and str(session_id) in self._session_to_worker:
-                        self._last_used_s[str(session_id)] = _now_s()
-                        await ws.send(packer.pack({"ok": True, "cmd": "pong", "request_id": request_id}))
-                    else:
-                        # If session is invalid/expired, let client know so it can stop pinging or re-request
-                        await ws.send(
-                            packer.pack(
-                                self._err(
-                                    code="invalid_session",
-                                    message="ping requires a valid active session_id",
-                                    details={"session_id": session_id},
-                                    request_id=request_id,
-                                )
-                            )
-                        )
-                    continue
-
-                if cmd == "reset":
-                    # If new_session=True, force allocate new worker lease.
-                    new_session = bool(req.get("new_session", False))
-                    if new_session:
-                        session_id = None
-
-                    if session_id and str(session_id) in self._session_to_worker:
-                        sid = str(session_id)
-                        wid = self._session_to_worker[sid]
-                    else:
-                        try:
-                            sid, wid = self._alloc_session(str(session_id) if session_id else None)
-                        except RuntimeError as e:
-                            if str(e) == "capacity_full":
-                                await ws.send(
-                                    packer.pack(
-                                        self._err(
-                                            code="capacity_full",
-                                            message="No free env workers; server at max_sessions",
-                                            details={"max_sessions": self._max_sessions},
-                                            request_id=request_id,
-                                        )
-                                    )
-                                )
-                                continue
-                            raise
-
-                    self._last_used_s[sid] = _now_s()
-                    # Forward seed/options to worker (RemoteEnv sends these fields).
-                    resp = await self._call_worker(
-                        wid,
-                        {
-                            "cmd": "reset",
-                            "seed": req.get("seed"),
-                            "options": req.get("options"),
-                        },
-                    )
-                    if "error" in resp:
-                        await ws.send(
-                            packer.pack(self._err(code="reset_failed", message=str(resp["error"]), request_id=request_id))
-                        )
-                        continue
-                    await ws.send(
-                        packer.pack(
-                            {
-                                "session_id": sid,
-                                "obs": resp.get("obs"),
-                                "info": resp.get("info") or {},
-                                "request_id": request_id,
-                            }
-                        )
-                    )
-                    continue
-
-                if cmd == "step":
-                    if not session_id or str(session_id) not in self._session_to_worker:
-                        await ws.send(
-                            packer.pack(
-                                self._err(
-                                    code="invalid_session",
-                                    message="step requires a valid session_id (call reset first)",
-                                    details={"session_id": session_id},
-                                    request_id=request_id,
-                                )
-                            )
-                        )
-                        continue
-                    sid = str(session_id)
-                    wid = self._session_to_worker[sid]
-                    self._last_used_s[sid] = _now_s()
-                    resp = await self._call_worker(wid, {"cmd": "step", "action": req.get("action")})
-                    if "error" in resp:
-                        err = resp.get("error") or {}
-                        await ws.send(
-                            packer.pack(
-                                {
-                                    "error": {
-                                        "code": "step_failed",
-                                        "message": err.get("message", str(err)),
-                                        "details": {"session_id": sid, "worker_error": err},
-                                    },
-                                    "request_id": request_id,
-                                }
-                            )
-                        )
-                        continue
-                    await ws.send(
-                        packer.pack(
-                            {
-                                "session_id": sid,
-                                "obs": resp.get("obs"),
-                                "reward": float(resp.get("reward", 0.0)),
-                                "terminated": bool(resp.get("terminated", False)),
-                                "truncated": bool(resp.get("truncated", False)),
-                                "done": bool(resp.get("done", False)),
-                                "info": resp.get("info") or {},
-                                "request_id": request_id,
-                            }
-                        )
-                    )
-                    continue
-
-                await ws.send(
-                    packer.pack(self._err(code="unknown_cmd", message=f"Unknown cmd: {cmd}", request_id=request_id))
-                )
-
-            except websockets.ConnectionClosed:
-                return
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Libero websocket env server (RemoteEnv-compatible, main.py-aligned max_steps)."
+        description="Libero websocket env server (RemoteEnv-compatible, built on GymEnvServer base class)."
     )
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--task_suite_name", default="libero_spatial")
     parser.add_argument("--task_id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
@@ -676,12 +473,6 @@ def main() -> None:
         type=int,
         default=None,
         help="Override per-suite max_steps (otherwise matches examples/libero/main.py).",
-    )
-    parser.add_argument(
-        "--horizon",
-        type=int,
-        default=None,
-        help="Optional: best-effort override underlying env horizon (robosuite time limit).",
     )
     parser.add_argument("--max_sessions", type=int, default=1, help="Max concurrent env sessions (fixed worker pool).")
     parser.add_argument(
@@ -702,7 +493,6 @@ def main() -> None:
         resize_size=args.resize_size,
         num_steps_wait=args.num_steps_wait,
         max_steps=args.max_steps,
-        horizon=args.horizon,
         max_sessions=args.max_sessions,
         session_idle_timeout_s=args.session_idle_timeout_s,
     ).serve_forever()
@@ -710,4 +500,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
