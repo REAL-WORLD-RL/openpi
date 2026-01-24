@@ -4,6 +4,7 @@ import logging
 import time
 import traceback
 
+import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
@@ -52,14 +53,50 @@ class WebsocketPolicyServer:
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
+        request_count = 0
         while True:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+                recv_time = time.monotonic()
+                request_count += 1
+                
+                # ========== 日志：打印接收到的输入 ==========
+                logger.info(f"[Request #{request_count}] Received obs at t={recv_time:.3f}s")
+                for key, value in obs.items():
+                    if isinstance(value, (np.ndarray, list)):
+                        arr = np.asarray(value)
+                        logger.info(f"  obs['{key}'].shape = {arr.shape}, dtype = {arr.dtype}")
+                    elif isinstance(value, dict):
+                        logger.info(f"  obs['{key}'] = dict with keys: {list(value.keys())}")
+                        for sub_key, sub_value in value.items():
+                            if isinstance(sub_value, (np.ndarray, list)):
+                                sub_arr = np.asarray(sub_value)
+                                logger.info(f"    obs['{key}']['{sub_key}'].shape = {sub_arr.shape}, dtype = {sub_arr.dtype}")
+                            else:
+                                logger.info(f"    obs['{key}']['{sub_key}'] = {type(sub_value).__name__}")
+                    else:
+                        logger.info(f"  obs['{key}'] = {type(value).__name__}: {str(value)[:100]}")
+                # ==========================================
 
-                infer_time = time.monotonic()
+                infer_start = time.monotonic()
                 action = self._policy.infer(obs)
-                infer_time = time.monotonic() - infer_time
+                infer_time = time.monotonic() - infer_start
+                output_time = time.monotonic()
+
+                # ========== 日志：打印输出的 action ==========
+                logger.info(f"[Request #{request_count}] Output action at t={output_time:.3f}s")
+                for key, value in action.items():
+                    if isinstance(value, (np.ndarray, list)):
+                        arr = np.asarray(value)
+                        logger.info(f"  action['{key}'].shape = {arr.shape}, dtype = {arr.dtype}")
+                    elif isinstance(value, dict):
+                        logger.info(f"  action['{key}'] = {value}")
+                    else:
+                        logger.info(f"  action['{key}'] = {type(value).__name__}")
+                logger.info(f"[Request #{request_count}] Inference time: {infer_time * 1000:.2f} ms")
+                logger.info(f"[Request #{request_count}] Total throughput time: {(output_time - recv_time) * 1000:.2f} ms")
+                # ==========================================
 
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,

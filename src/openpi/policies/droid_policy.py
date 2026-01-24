@@ -78,4 +78,11 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        actions = np.asarray(data["actions"])
+        # Handle both single sample (action_horizon, action_dim) and batch (batch_size, action_horizon, action_dim)
+        if actions.ndim == 2:
+            return {"actions": actions[:, :8]}
+        elif actions.ndim == 3:
+            return {"actions": actions[:, :, :8]}
+        else:
+            raise ValueError(f"Unexpected actions shape: {actions.shape}")

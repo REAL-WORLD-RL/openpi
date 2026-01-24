@@ -97,7 +97,14 @@ class AlohaOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])
+        actions = np.asarray(data["actions"])
+        # Handle both single sample (action_horizon, action_dim) and batch (batch_size, action_horizon, action_dim)
+        if actions.ndim == 2:
+            actions = actions[:, :14]
+        elif actions.ndim == 3:
+            actions = actions[:, :, :14]
+        else:
+            raise ValueError(f"Unexpected actions shape: {actions.shape}")
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
 

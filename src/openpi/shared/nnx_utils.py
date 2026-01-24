@@ -24,6 +24,9 @@ def module_jit(meth: Callable[P, R], *jit_args, **jit_kwargs) -> Callable[P, R]:
     `module_jit` acts exactly like the original method, except that the state of the module is frozen to whatever it was
     when `module_jit` was called. Mutations to the module within `meth` are still allowed, but they will be discarded
     after the method call completes.
+    
+    This version supports dynamic batch sizes by not fixing array shapes in the JIT compilation. JAX will compile
+    separate versions for each unique batch size encountered (e.g., batch=1 for evaluation, batch=64 for training).
     """
     if not (inspect.ismethod(meth) and isinstance(meth.__self__, nnx.Module)):
         raise ValueError("module_jit must only be used on bound methods of nnx.Modules.")
@@ -34,6 +37,8 @@ def module_jit(meth: Callable[P, R], *jit_args, **jit_kwargs) -> Callable[P, R]:
         module = nnx.merge(graphdef, state)
         return meth.__func__(module, *args, **kwargs)
 
+    # Use jax.jit without static_argnums to allow dynamic batch sizes
+    # JAX will cache a separate compiled version for each unique input shape
     jitted_fn = jax.jit(fun, *jit_args, **jit_kwargs)
 
     @functools.wraps(meth)

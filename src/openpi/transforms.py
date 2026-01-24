@@ -82,23 +82,68 @@ class RepackTransform(DataTransformFn):
 
     Repacking is defined using a dictionary where the keys are the new keys and the values
     are the flattened paths to the old keys. We use '/' as the separator during flattening.
+    
+    Values can be either:
+    - A single string key
+    - A list/tuple of candidate keys (will try in order and use the first one found)
+    - None (indicates the key is optional and will be skipped if not found)
 
     Example:
     {
         "images": {
-            "cam_high": "observation.images.top",
+            "cam_high": ["observation.images.top", "observation.images.front"],  # Try top first, then front
             "cam_low": "observation.images.bottom",
+            "cam_optional": None,  # Optional key, will be skipped if not found
         },
         "state": "observation.state",
         "actions": "action",
     }
     """
 
-    structure: at.PyTree[str]
+    structure: at.PyTree[str | Sequence[str] | None]
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        
+        def get_value(key_or_keys):
+            # If None, this is an optional key - return a sentinel to skip it
+            if key_or_keys is None:
+                return _SKIP_KEY_SENTINEL
+            
+            # If it's a sequence of candidate keys, try them in order
+            if isinstance(key_or_keys, (list, tuple)):
+                for candidate_key in key_or_keys:
+                    if candidate_key in flat_item:
+                        return flat_item[candidate_key]
+                # If none found, raise error
+                raise KeyError(f"None of the candidate keys {key_or_keys} found in data. Available keys: {list(flat_item.keys())}")
+            else:
+                # Single key - check if it exists
+                if key_or_keys in flat_item:
+                    return flat_item[key_or_keys]
+                else:
+                    # Key not found - return sentinel to skip it
+                    return _SKIP_KEY_SENTINEL
+        
+        # Treat lists/tuples as leaf nodes (not as pytrees to traverse)
+        def is_leaf(x):
+            return isinstance(x, (list, tuple))
+        
+        result = jax.tree.map(get_value, self.structure, is_leaf=is_leaf)
+        
+        # Remove keys that were skipped (sentinel values)
+        return _remove_skipped_keys(result)
+
+
+# Sentinel value to mark keys that should be skipped
+_SKIP_KEY_SENTINEL = object()
+
+
+def _remove_skipped_keys(tree: at.PyTree) -> at.PyTree:
+    """Remove keys from a nested dict that have the sentinel value."""
+    flat_dict = flatten_dict(tree)
+    filtered = {k: v for k, v in flat_dict.items() if v is not _SKIP_KEY_SENTINEL}
+    return unflatten_dict(filtered)
 
 
 @dataclasses.dataclass(frozen=True)

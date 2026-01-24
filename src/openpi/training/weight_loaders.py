@@ -73,6 +73,107 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class AdaptiveActionDimWeightLoader(WeightLoader):
+    """Loads weights from a checkpoint and adapts action dimension mismatches.
+
+    This loader wraps a CheckpointWeightLoader and adapts the action projection layers
+    (action_in_proj and action_out_proj) when the checkpoint has a different action_dim
+    than the target model. It slices the weights to match the target action_dim.
+
+    Args:
+        params_path: Path to the checkpoint to load.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        """Load weights and adapt action dimension mismatches."""
+        # Load checkpoint directly (bypassing shape checks)
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+
+        # Flatten both parameter dictionaries for easier manipulation
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+        # Adapt action projection layers if dimensions don't match
+        result = {}
+        for k, v_ref in flat_ref.items():
+            if k in flat_loaded:
+                v_loaded = flat_loaded[k]
+                # Check if this is an action projection layer that needs adaptation
+                if "action_in_proj/kernel" in k:
+                    # action_in_proj.kernel: (action_dim, hidden_dim)
+                    # Need to slice first dimension (rows)
+                    if v_loaded.shape[0] != v_ref.shape[0]:
+                        logger.info(
+                            f"Adapting {k}: slicing from {v_loaded.shape} to {v_ref.shape} "
+                            f"(taking first {v_ref.shape[0]} rows)"
+                        )
+                        result[k] = v_loaded[: v_ref.shape[0], :].astype(v_ref.dtype)
+                    elif v_loaded.shape == v_ref.shape:
+                        result[k] = v_loaded.astype(v_ref.dtype) if v_loaded.dtype != v_ref.dtype else v_loaded
+                    else:
+                        logger.warning(
+                            f"Shape mismatch for {k}: loaded {v_loaded.shape} != expected {v_ref.shape}. "
+                            "Using reference (initialized) weights."
+                        )
+                        result[k] = v_ref
+                elif "action_out_proj/kernel" in k:
+                    # action_out_proj.kernel: (hidden_dim, action_dim)
+                    # Need to slice second dimension (columns)
+                    if v_loaded.shape[1] != v_ref.shape[1]:
+                        logger.info(
+                            f"Adapting {k}: slicing from {v_loaded.shape} to {v_ref.shape} "
+                            f"(taking first {v_ref.shape[1]} columns)"
+                        )
+                        result[k] = v_loaded[:, : v_ref.shape[1]].astype(v_ref.dtype)
+                    elif v_loaded.shape == v_ref.shape:
+                        result[k] = v_loaded.astype(v_ref.dtype) if v_loaded.dtype != v_ref.dtype else v_loaded
+                    else:
+                        logger.warning(
+                            f"Shape mismatch for {k}: loaded {v_loaded.shape} != expected {v_ref.shape}. "
+                            "Using reference (initialized) weights."
+                        )
+                        result[k] = v_ref
+                elif "action_out_proj/bias" in k:
+                    # action_out_proj.bias: (action_dim,)
+                    # Need to slice first dimension
+                    if v_loaded.shape[0] != v_ref.shape[0]:
+                        logger.info(
+                            f"Adapting {k}: slicing from {v_loaded.shape} to {v_ref.shape} "
+                            f"(taking first {v_ref.shape[0]} elements)"
+                        )
+                        result[k] = v_loaded[: v_ref.shape[0]].astype(v_ref.dtype)
+                    elif v_loaded.shape == v_ref.shape:
+                        result[k] = v_loaded.astype(v_ref.dtype) if v_loaded.dtype != v_ref.dtype else v_loaded
+                    else:
+                        logger.warning(
+                            f"Shape mismatch for {k}: loaded {v_loaded.shape} != expected {v_ref.shape}. "
+                            "Using reference (initialized) weights."
+                        )
+                        result[k] = v_ref
+                else:
+                    # For other parameters, use normal merging (shape must match)
+                    if v_loaded.shape == v_ref.shape:
+                        result[k] = v_loaded.astype(v_ref.dtype) if v_loaded.dtype != v_ref.dtype else v_loaded
+                    else:
+                        # Shape mismatch for non-action layers - use reference (will be initialized)
+                        logger.warning(
+                            f"Shape mismatch for {k}: loaded {v_loaded.shape} != expected {v_ref.shape}. "
+                            "Using reference (initialized) weights."
+                        )
+                        result[k] = v_ref
+            else:
+                # Key not in loaded params, use reference (will be initialized)
+                result[k] = v_ref
+
+        # Merge LoRA weights that might be missing
+        return _merge_params(
+            flax.traverse_util.unflatten_dict(result, sep="/"), params, missing_regex=".*lora.*"
+        )
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
